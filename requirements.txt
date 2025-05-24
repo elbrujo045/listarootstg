@@ -1,3 +1,3 @@
-python-telegram-bot
+python-telegram-bot 22.1
 flask
-gunicorn # Servidor HTTP para o Flask (Render usa gunicorn por padrão)
+pytz
