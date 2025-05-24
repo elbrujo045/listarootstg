@@ -5,6 +5,7 @@ import datetime
 import json
 import random
 from datetime import timedelta
+import pytz # Importa a biblioteca pytz para lidar com fusos horários
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -14,7 +15,6 @@ from flask import Flask
 from threading import Thread
 
 # --- Configuração de Log ---
-# Essencial para ver o que o bot está fazendo nos bastidores
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.DEBUG # MANTENHA COMO DEBUG para depuração completa
@@ -22,8 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Variáveis Globais (Carregadas ou Definidas) ---
-# Use o token do bot da variável de ambiente ou substitua diretamente (NÃO RECOMENDADO EM PRODUÇÃO)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7452415037:AAHPYwIeI_2TAXCUHxcKcaZfSPX7E7Nv7eg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "SEU_TOKEN_DO_BOT_AQUI")
 if BOT_TOKEN == "SEU_TOKEN_DO_BOT_AQUI":
     logger.critical("ATENÇÃO: BOT_TOKEN não configurado! Por favor, defina a variável de ambiente BOT_TOKEN.")
 
@@ -32,6 +31,12 @@ DATA_FILE = 'bot_data.json' # Arquivo para persistir os dados
 
 ADMIN_CHAT_ID = None # Será definido pelo comando /start pelo primeiro usuário
 
+# Define o fuso horário para o agendamento.
+# É CRUCIAL que você defina o fuso horário correto para a sua região.
+# Ex: 'America/Sao_Paulo' para horário de Brasília.
+# Para ver a lista completa de fusos horários válidos, pesquise por "List of tz database time zones"
+TIMEZONE = pytz.timezone('America/Sao_Paulo') # ALtere se sua região for diferente
+
 # --- Funções de Persistência de Dados ---
 def load_data():
     global bot_data, ADMIN_CHAT_ID
@@ -39,13 +44,12 @@ def load_data():
         with open(DATA_FILE, 'r') as f:
             loaded_data = json.load(f)
             # Converte chaves de volta para int se necessário (chat_ids são strings para chaves de JSON)
-            # Garante que as estruturas básicas existam para evitar KeyError
             bot_data['canais_e_grupos'] = {int(k): v for k, v in loaded_data.get('canais_e_grupos', {}).items()}
             bot_data['agendamentos'] = {int(k): v for k, v in loaded_data.get('agendamentos', {}).items()}
             bot_data['cabecalho_texto'] = loaded_data.get('cabecalho_texto', "✨ **Confira essas listas de canais e grupos no Telegram!** ✨")
             bot_data['cabecalho_media_id'] = loaded_data.get('cabecalho_media_id', None)
             bot_data['cabecalho_media_type'] = loaded_data.get('cabecalho_media_type', None)
-            ADMIN_CHAT_ID = loaded_data.get('ADMIN_CHAT_ID')
+            ADMIN_CHAT_ID = loaded_data.get('ADMIN_CHAT_ID') # Carrega ADMIN_CHAT_ID persistente
             logger.info("Dados do bot carregados com sucesso.")
             if ADMIN_CHAT_ID:
                 logger.info(f"ADMIN_CHAT_ID carregado: {ADMIN_CHAT_ID}")
@@ -63,6 +67,7 @@ def save_data():
     data_to_save = bot_data.copy()
     data_to_save['canais_e_grupos'] = {str(k): v for k, v in bot_data.get('canais_e_grupos', {}).items()}
     data_to_save['agendamentos'] = {str(k): v for k, v in bot_data.get('agendamentos', {}).items()}
+    data_to_save['ADMIN_CHAT_ID'] = ADMIN_CHAT_ID # Salva o ADMIN_CHAT_ID global
 
     with open(DATA_FILE, 'w') as f:
         json.dump(data_to_save, f, indent=4)
@@ -148,7 +153,7 @@ async def send_daily_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_name = bot_data['canais_e_grupos'].get(chat_id_int, {}).get('nome', 'Desconhecido')
             falhas_detalhes.append(f"- **{chat_name}** (`{chat_id_int}`): Bot foi bloqueado ou removido. (Removido da lista)")
             logger.warning(f"Bot foi bloqueado ou removido do chat: {chat_id_int}. Marcando para remoção.")
-            canais_para_remover.append(chat_id_int) # Adiciona o ID inteiro para remoção
+            canais_para_remover.append(chat_id_int)
         except BadRequest as e:
             falhas += 1
             chat_name = bot_data['canais_e_grupos'].get(chat_id_int, {}).get('nome', 'Desconhecido')
@@ -182,6 +187,7 @@ async def send_daily_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def agendar_daily_jobs_on_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Agenda os jobs diários com base nos horários configurados."""
+    logger.info("Iniciando agendamento de jobs diários na inicialização.")
     if not ADMIN_CHAT_ID:
         logger.warning("Não há ADMIN_CHAT_ID definido. Não é possível agendar trabalhos.")
         return
@@ -194,7 +200,7 @@ async def agendar_daily_jobs_on_startup(context: ContextTypes.DEFAULT_TYPE) -> N
     current_jobs = context.job_queue.get_jobs_by_name("daily_post_job")
     for job in current_jobs:
         job.schedule_removal()
-        logger.debug(f"Job existente 'daily_post_job' removido: {job.next_run_time}")
+        logger.info(f"Job existente 'daily_post_job' removido: {job.next_run_time}")
 
     if not ativo or not horarios_str:
         logger.info("Agendamento desativado ou sem horários definidos para o admin. Nenhum job será agendado.")
@@ -205,19 +211,49 @@ async def agendar_daily_jobs_on_startup(context: ContextTypes.DEFAULT_TYPE) -> N
                  logger.error(f"Erro ao enviar mensagem de desativação de agendamento ao admin: {e}")
         return
 
+    agendados_com_sucesso = []
     for horario_str in horarios_str:
         try:
-            h = datetime.time.fromisoformat(horario_str)
-            context.job_queue.run_daily(
+            # Converte o horário para um objeto time aware do fuso horário definido
+            h_naive = datetime.time.fromisoformat(horario_str)
+            # Combina com uma data mínima e localiza no fuso horário para obter um datetime aware
+            # Em seguida, extrai apenas a parte do tempo aware para usar com run_daily
+            h_aware = TIMEZONE.localize(datetime.datetime.combine(datetime.date.min, h_naive)).time()
+
+            job = context.job_queue.run_daily(
                 send_daily_posts,
-                time=h,
+                time=h_aware, # Usa o objeto time com fuso horário
                 days=tuple(range(7)),  # Todos os dias da semana
                 data={'admin_id': ADMIN_CHAT_ID},
                 name="daily_post_job"
             )
-            logger.info(f"Job 'daily_post_job' agendado para {horario_str} (fuso horário do servidor).")
+            # Calcula a próxima execução no fuso horário *definido* para o feedback
+            # job.next_run_time já está em UTC. Convertemos para o fuso horário que o usuário configurou para exibição.
+            next_run_display = job.next_run_time.astimezone(TIMEZONE).strftime('%d/%m %H:%M')
+            agendados_com_sucesso.append(f"• {horario_str} (próxima execução: {next_run_display})")
+            logger.info(f"Job 'daily_post_job' agendado para {horario_str} ({TIMEZONE.tzname(datetime.datetime.now())}). Próxima execução (UTC): {job.next_run_time}")
         except ValueError:
             logger.error(f"Horário inválido '{horario_str}' no agendamento. Ignorando.")
+        except Exception as e:
+            logger.error(f"Erro inesperado ao agendar para '{horario_str}': {e}", exc_info=True)
+
+    if agendados_com_sucesso and ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="✅ **Agendamentos de posts diários ativos:**\n" + "\n".join(agendados_com_sucesso) + f"\n\n*(Horários em {TIMEZONE.tzname(datetime.datetime.now())})*",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Erro ao enviar confirmação de agendamento ao admin: {e}")
+    elif ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="❌ **Nenhum agendamento diário válido foi configurado ou ativado.** Use /agendar para definir horários."
+            )
+        except Exception as e:
+            logger.error(f"Erro ao enviar mensagem de nenhum agendamento ao admin: {e}")
 
 
 # --- Handlers de Comandos ---
@@ -232,14 +268,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if ADMIN_CHAT_ID is None:
         ADMIN_CHAT_ID = chat_id
-        bot_data['ADMIN_CHAT_ID'] = chat_id
-        save_data()
+        # bot_data['ADMIN_CHAT_ID'] = chat_id # Já está sendo salvo na função save_data() via global
+        save_data() # Salva imediatamente o ADMIN_CHAT_ID para persistência
         logger.info(f"ADMIN_CHAT_ID definido como {chat_id} por {user_name}.")
         await update.message.reply_text(
             f"Olá, {user_name}! Você foi definido como o administrador deste bot.\n\n"
             "Use /ajuda para ver os comandos disponíveis."
         )
         # Tenta agendar jobs se já houver horários configurados para o novo admin
+        # CHAMADA AQUI É CRUCIAL PARA INICIALIZAR JOBS SE HOUVER ADMIN
         await agendar_daily_jobs_on_startup(context)
     elif chat_id == ADMIN_CHAT_ID:
         await update.message.reply_text(
@@ -325,6 +362,7 @@ async def agendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Ex: `09:00, 15:30, 21:00`\n\n"
         f"Agendamentos atuais: {', '.join(current_horarios) if current_horarios else 'Nenhum'}\n"
         f"Status: {status_agenda}\n"
+        f"*(Horário de referência: {TIMEZONE.tzname(datetime.datetime.now())})*\n" # Informa o fuso horário
         "Envie /cancelar para abortar."
     )
 
@@ -392,7 +430,7 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         # Cria os botões para os comandos de administrador
         keyboard.append([InlineKeyboardButton("Ver Canais Cadastrados", callback_data="admin_ver_canais")])
-        keyboard.append([InlineKeyboardButton("Editar Cabeçalho", callback_data="admin_editar_cabecalho")]) # Novo botão
+        keyboard.append([InlineKeyboardButton("Editar Cabeçalho", callback_data="admin_editar_cabecalho")])
         keyboard.append([InlineKeyboardButton("Agendar Publicações", callback_data="admin_agendar")])
         keyboard.append([InlineKeyboardButton("Parar Agendamento", callback_data="admin_parar_agendamento")])
         keyboard.append([InlineKeyboardButton("Retomar Agendamento", callback_data="admin_retomar_agendamento")])
@@ -408,7 +446,10 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancela a operação atual."""
     message = update.message if update.message else update.callback_query.message
     if 'estado' in context.user_data:
-        del context.user_data['estado']
+        logger.debug(f"DEBUG: Cancelando operação, estado '{context.user_data.get('estado')}' de {message.chat.id}")
+        context.user_data.pop('estado', None) # Remove de forma segura
+        context.user_data.pop('user_id_cadastro', None) # Remove o user_id_cadastro
+        context.user_data.pop('cadastrando_link', None) # Remove o link de cadastro
         await message.reply_text("Operação cancelada.")
     else:
         await message.reply_text("Nenhuma operação em andamento para cancelar.")
@@ -443,8 +484,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Verificação de segurança: Apenas o ADMIN_CHAT_ID pode usar os botões de administrador
     # (Ou botões que ele iniciou, como remover_canal)
+    # Permite que não-admins cliquem em botões de remoção que o admin gerou
     if query.message.chat.id != ADMIN_CHAT_ID and not query.data.startswith('remove_chat_'):
-        # Permite que não-admins cliquem em botões de remoção que o admin gerou
         await query.edit_message_text("Desculpe, esta ação é apenas para administradores.")
         return
 
@@ -466,7 +507,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Carregando lista de canais...")
         await ver_canais_e_grupos(update, context) # Passa update completo para a função
     
-    elif query.data == 'admin_editar_cabecalho': # Novo callback para o fluxo de edição
+    elif query.data == 'admin_editar_cabecalho':
         await query.edit_message_text("Iniciando edição do cabeçalho...")
         await editar_cabecalho(update, context)
 
@@ -536,431 +577,318 @@ async def handle_text_response(update: Update, context: ContextTypes.DEFAULT_TYP
                     link.startswith("https://telegram.me/") or link.startswith("http://telegram.me/") or \
                     link.startswith("t.me/") or link.startswith("telegram.me/")): # Adicionado sem https/http
                 await update.message.reply_text(
-                    "O link parece ser do Telegram, mas não está no formato esperado (ex: `https://t.me/seucanal` ou `t.me/seucanal`). Por favor, use o link de convite completo."
-                , parse_mode='Markdown')
-                return # Não limpa o estado, espera nova entrada
-            
-            # Normaliza o link para ter https:// se não tiver
-            if not link.startswith("http"):
-                link = "https://" + link
+                    "O link parece inválido. Por favor, envie um link de convite válido que comece com `https://t.me/` ou `https://t.me/+`.\n"
+                    "Envie /cancelar para abortar."
+                    , parse_mode='Markdown'
+                )
+                return
 
-            context.user_data['cadastrando_link'] = link # Armazena o link temporariamente
+            context.user_data['cadastrando_link'] = link
+            # Remove o estado temporário aguardando_link_cadastro
+            context.user_data.pop('estado', None)
+
+            # Pede para adicionar o bot ao canal/grupo
+            keyboard = [[InlineKeyboardButton("Adicionar Bot ao Canal/Grupo", url="https://t.me/SEU_BOT_USERNAME?startgroup=true")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Pede confirmação
             await update.message.reply_text(
-                f"Link recebido: `{link}`. Agora, por favor, me adicione como **administrador** no seu canal/grupo. "
-                "Assim que eu for adicionado, enviarei uma mensagem de confirmação e adicionarei o canal/grupo à lista.\n"
-                "**Permissões necessárias para mim:**\n"
-                "- **Administrador completo** (ou, no mínimo, 'Postar mensagens' e 'Adicionar membros').\n"
-                "- `Postar mensagens` (para que eu possa publicar a lista).\n"
-                "- `Adicionar membros` (para que eu possa verificar a contagem de membros se for um link privado/convite).\n"
-                "\n*Obs: Seu canal/grupo deve ter 50 membros ou mais para ser adicionado.*",
-                parse_mode='Markdown')
-            # Não remove o estado aqui. O estado é removido por new_chat_members quando o bot é adicionado.
-            # Se o bot não for adicionado, o usuário pode tentar novamente ou cancelar.
-            logger.debug(f"DEBUG: Link '{link}' armazenado em context.user_data para {user_chat_id}. Estado 'aguardando_link_cadastro' mantido.")
+                "✅ Link recebido! Agora, por favor, adicione este bot ao seu canal ou grupo como **administrador** (com permissão para enviar mensagens).\n\n"
+                "Após adicionar o bot, clique em 'Verificar Adesão' para que eu possa confirmar.\n"
+                "Envie /cancelar para abortar."
+                , reply_markup=reply_markup
+                , parse_mode='Markdown'
+            )
+            # Define o próximo estado para aguardar a adição do bot
+            context.user_data['estado'] = 'aguardando_adesao_bot'
+            save_data() # Salva o estado para persistência se o bot reiniciar
+
+
         else:
             await update.message.reply_text(
-                "Parece que não é um link válido do Telegram. Por favor, tente novamente. O link deve começar com `t.me/` ou `telegram.me/`."
+                "Parece que não é um link de convite válido do Telegram. Por favor, envie um link que contenha `t.me/` ou `telegram.me/`.\n"
+                "Envie /cancelar para abortar."
             )
-    # Lida com estados de admin
-    elif user_chat_id == ADMIN_CHAT_ID:
-        if current_state == 'aguardando_texto_cabecalho_fluxo':
-            bot_data['cabecalho_texto'] = update.message.text
-            await update.message.reply_text(
-                f"Texto do cabeçalho atualizado para:\n`{bot_data['cabecalho_texto']}`",
-                parse_mode='Markdown')
-            save_data()
-            context.user_data.pop('estado')
-        elif current_state == 'aguardando_horarios_agendamento':
-            horarios_str_input = update.message.text
-            horarios_validos = []
-            erros_horario = []
-            for h in horarios_str_input.split(','):
-                h_stripped = h.strip()
-                try:
-                    datetime.time.fromisoformat(h_stripped)
-                    horarios_validos.append(h_stripped)
-                except ValueError:
-                    erros_horario.append(h_stripped)
-            
-            if erros_horario:
-                await update.message.reply_text(
-                    f"Horário(s) inválido(s) encontrado(s): `{', '.join(erros_horario)}`. Por favor, use o formato HH:MM (ex: 09:00, 15:30) e tente novamente."
-                , parse_mode='Markdown')
-                return # Não limpa o estado, espera nova entrada
-            
-            if not horarios_validos:
-                await update.message.reply_text(
-                    "Nenhum horário válido fornecido. Por favor, tente novamente."
-                )
-                return # Não limpa o estado, espera nova entrada
+            return
 
-            bot_data['agendamentos'][ADMIN_CHAT_ID] = { # Salva com ADMIN_CHAT_ID como int
-                'horarios': horarios_validos,
+    # Lida com o estado de agendamento (apenas para o admin)
+    elif current_state == 'aguardando_horarios_agendamento' and user_chat_id == ADMIN_CHAT_ID:
+        horarios_input = update.message.text.strip()
+        horarios_list = [h.strip() for h in horarios_input.split(',')]
+        valid_horarios = []
+        invalid_horarios = []
+
+        for h in horarios_list:
+            try:
+                datetime.time.fromisoformat(h) # Tenta converter para validar o formato HH:MM
+                valid_horarios.append(h)
+            except ValueError:
+                invalid_horarios.append(h)
+
+        if valid_horarios:
+            bot_data.setdefault('agendamentos', {})
+            # Garante que ADMIN_CHAT_ID é um int para ser a chave
+            bot_data['agendamentos'][ADMIN_CHAT_ID] = {
+                'horarios': valid_horarios,
                 'ativo': True
             }
-            await update.message.reply_text(
-                f"Agendamentos configurados para os seguintes horários: {', '.join(horarios_validos)}\n"
-                "As publicações ocorrerão diariamente nestes horários."
-            )
             save_data()
-            context.user_data.pop('estado')
-            await agendar_daily_jobs_on_startup(context) # Re-agenda com os novos horários
+            context.user_data.pop('estado', None) # Limpa o estado
+            
+            await update.message.reply_text(
+                f"✅ Horários salvos e agendamento ativado!\n"
+                f"Horários agendados: {', '.join(valid_horarios)}\n"
+                f"Os posts serão enviados diariamente nesses horários (Fuso: {TIMEZONE.tzname(datetime.datetime.now())})."
+            )
+            await agendar_daily_jobs_on_startup(context) # Re-agenda os jobs com os novos horários
         else:
-            # Estado de admin não reconhecido
-            await update.message.reply_text("Desculpe, um estado inesperado foi encontrado. Tente novamente ou use /cancelar.")
-            logger.warning(f"Estado de admin '{current_state}' não tratado em handle_text_response para {user_chat_id}.")
+            await update.message.reply_text(
+                "Nenhum horário válido foi fornecido. Por favor, use o formato HH:MM (ex: `09:00, 15:30`).\n"
+                f"Horários inválidos ignorados: {', '.join(invalid_horarios)}\n"
+                "Envie /cancelar para abortar."
+            )
+    
+    # Lida com a edição de texto do cabeçalho (apenas para o admin)
+    elif current_state == 'aguardando_texto_cabecalho_fluxo' and user_chat_id == ADMIN_CHAT_ID:
+        new_text = update.message.text
+        bot_data['cabecalho_texto'] = new_text
+        save_data()
+        context.user_data.pop('estado', None)
+        await update.message.reply_text(
+            f"✅ Texto do cabeçalho atualizado com sucesso!\n\nPreview:\n{new_text}"
+            , parse_mode='Markdown'
+        )
+        logger.info(f"Texto do cabeçalho atualizado pelo admin {ADMIN_CHAT_ID}.")
+
+    # Lida com respostas que não correspondem a nenhum estado conhecido
     else:
-        # Resposta padrão para mensagens de texto que não são comandos ou estados esperados
-        await update.message.reply_text("Desculpe, não entendi o que você quis dizer. Use /ajuda para ver os comandos disponíveis.")
+        # Se não há estado, é uma mensagem normal.
+        # Ou se o estado não é esperado para o tipo de mensagem.
+        # Você pode adicionar um tratamento para mensagens desconhecidas aqui.
+        logger.debug(f"Mensagem de texto não tratada: {update.message.text} de {update.message.chat_id}")
+        # await update.message.reply_text("Desculpe, não entendi. Use /ajuda para ver os comandos.")
 
 
-async def handle_media_cabecalho(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lida com o envio de mídia para o cabeçalho."""
-    if not update.message:
-        logger.warning("handle_media_cabecalho foi chamada, mas update.message é None. Ignorando a atualização.")
-        return
-
+async def handle_media_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lida com o recebimento de mídia para o cabeçalho."""
     user_chat_id = update.message.chat_id
     current_state = context.user_data.get('estado')
 
-    if user_chat_id == ADMIN_CHAT_ID and current_state == 'aguardando_media_cabecalho_fluxo':
+    if current_state == 'aguardando_media_cabecalho_fluxo' and user_chat_id == ADMIN_CHAT_ID:
+        media_id = None
+        media_type = None
+
         if update.message.photo:
-            bot_data['cabecalho_media_id'] = update.message.photo[-1].file_id # Pega a maior resolução
-            bot_data['cabecalho_media_type'] = 'photo'
-            await update.message.reply_text("Imagem do cabeçalho atualizada com sucesso!")
-            save_data()
-        elif update.message.animation:
-            bot_data['cabecalho_media_id'] = update.message.animation.file_id
-            bot_data['cabecalho_media_type'] = 'animation'
-            await update.message.reply_text("GIF do cabeçalho atualizado com sucesso!")
-            save_data()
+            media_id = update.message.photo[-1].file_id # Pega a maior resolução
+            media_type = 'photo'
         elif update.message.video:
-            bot_data['cabecalho_media_id'] = update.message.video.file_id
-            bot_data['cabecalho_media_type'] = 'video'
-            await update.message.reply_text("Vídeo do cabeçalho atualizado com sucesso!")
+            media_id = update.message.video.file_id
+            media_type = 'video'
+        elif update.message.animation: # Para GIFs
+            media_id = update.message.animation.file_id
+            media_type = 'animation'
+        
+        if media_id and media_type:
+            bot_data['cabecalho_media_id'] = media_id
+            bot_data['cabecalho_media_type'] = media_type
             save_data()
+            context.user_data.pop('estado', None)
+            await update.message.reply_text(f"✅ Mídia do cabeçalho ({media_type}) atualizada com sucesso!")
+            logger.info(f"Mídia do cabeçalho ({media_type}) atualizada pelo admin {ADMIN_CHAT_ID}.")
         else:
-            await update.message.reply_text("Por favor, envie uma foto, GIF ou vídeo para o cabeçalho.")
-            return # Não limpa o estado se a mídia não for válida
-        context.user_data.pop('estado')
-    elif user_chat_id == ADMIN_CHAT_ID: # Mídia enviada pelo admin, mas não no estado correto
-         await update.message.reply_text("Por favor, use o comando /editar_cabecalho primeiro para iniciar a edição do cabeçalho.")
-    else: # Mídia enviada por outro usuário, não é um comando ou estado esperado
-        await update.message.reply_text("Desculpe, não entendi o que você quis dizer. Use /ajuda para ver os comandos disponíveis.")
+            await update.message.reply_text("Por favor, envie uma foto, GIF ou vídeo válido para o cabeçalho. Outros tipos de mídia não são suportados para o cabeçalho.")
+    else:
+        logger.debug(f"Mídia não tratada: {update.message} de {update.message.chat_id} (Estado: {current_state})")
 
 
-async def new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lida com a adição de novos membros ao chat, incluindo o próprio bot."""
-    logger.debug(f"DEBUG: >>> FUNÇÃO new_chat_members FOI ACIONADA <<<")
-    
-    if not update.message: 
-        logger.warning("DEBUG: new_chat_members chamada sem update.message. Ignorando.")
-        return
-
-    chat_id = update.message.chat_id
-    chat_title = update.message.chat.title if update.message.chat.title else f"Chat ID {chat_id}"
-    chat_type = update.message.chat.type
-    bot_member = await context.bot.get_me()
-    logger.debug(f"DEBUG: Chat ID: {chat_id}, Título: '{chat_title}', Tipo: '{chat_type}', ID do Bot: {bot_member.id}")
-
-    # Itera sobre os novos membros adicionados
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verifica se o bot foi adicionado a um canal/grupo para cadastro."""
+    bot_member = None
     for member in update.message.new_chat_members:
-        logger.debug(f"DEBUG: Membro adicionado: {member.full_name} (ID: {member.id}), é bot: {member.is_bot}")
+        if member.id == context.bot.id:
+            bot_member = member
+            break
 
-        # Se o membro adicionado for o próprio bot
-        if member.id == bot_member.id:
-            logger.debug(f"DEBUG: O bot foi identificado como o membro adicionado.")
+    if bot_member:
+        chat_id_joined = update.message.chat_id
+        chat_name = update.message.chat.title
+        chat_type = update.message.chat.type # 'group', 'supergroup', 'channel'
 
+        # Verifica se é um grupo ou canal (supergroup)
+        if chat_type in ['group', 'supergroup', 'channel']:
+            # Verifique se o bot está no estado 'aguardando_adesao_bot' e se o user_id_cadastro é o admin
+            # Ou, de forma mais geral, se o ADMIN_CHAT_ID está realizando o cadastro
+            user_id_requesting_cadastro = context.user_data.get('user_id_cadastro')
+            cadastrando_link = context.user_data.get('cadastrando_link')
+
+            # Tenta obter informações do chat para validar o link
+            chat_info = None
             try:
-                # Obtém o status do bot no chat para verificar permissões
-                chat_member_status = await context.bot.get_chat_member(chat_id, bot_member.id)
-                
-                is_admin_in_chat = chat_member_status.status == ChatMember.ADMINISTRATOR
-                has_post_messages_perm = chat_member_status.can_post_messages if chat_member_status.can_post_messages is not None else False
-                
-                logger.debug(f"DEBUG: Status do Bot em '{chat_title}': Admin: {is_admin_in_chat}, Pode Postar Mensagens: {has_post_messages_perm}")
-
-                # Condição de Permissão: O bot DEVE ser administrador e ter permissão para postar mensagens.
-                if is_admin_in_chat and has_post_messages_perm:
-                    logger.info(f"INFO: Bot tem permissões adequadas em '{chat_title}' (ID: {chat_id}). Prosseguindo com o cadastro.")
-
-                    invite_link = context.user_data.pop('cadastrando_link', "Link não encontrado ou privado")
-                    user_id_solicitante = context.user_data.pop('user_id_cadastro', None) # Pega o ID do solicitante
-                    
-                    try:
-                        # Tenta obter o link de convite (só funciona se o bot for admin e tiver permissão)
-                        if chat_type in ['channel', 'supergroup']:
-                            new_invite_link = await context.bot.export_chat_invite_link(chat_id)
-                            logger.debug(f"DEBUG: Novo link de convite obtido: {new_invite_link}")
-                            # Prioriza o link obtido pelo bot se for diferente do que o usuário enviou
-                            if new_invite_link and "t.me/" in new_invite_link:
-                                invite_link = new_invite_link
-                        else:
-                             logger.debug("DEBUG: Tipo de chat não suporta export_chat_invite_link ou não é relevante.")
-                    except Exception as e:
-                        logger.warning(f"AVISO: Erro ao obter link de convite para {chat_id}: {e}")
-
-                    num_members = 0
-                    try:
-                        # Tenta obter o número de membros (approximate_member_count está em Chat)
-                        chat_info = await context.bot.get_chat(chat_id)
-                        num_members = chat_info.approximate_member_count if chat_info.approximate_member_count is not None else 0
-                        logger.debug(f"DEBUG: Número aproximado de membros: {num_members}")
-                    except Exception as e:
-                        logger.warning(f"AVISO: Não foi possível obter o número de membros para {chat_id}: {e}")
-
-                    # REGRA DE 50 MEMBROS (Aplicada apenas se não for um chat privado)
-                    if chat_type != 'private' and num_members < 50:
-                        logger.info(f"INFO: Canal/grupo '{chat_title}' (ID: {chat_id}) com {num_members} membros. Ignorado por ter menos de 50 membros.")
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"Olá! Eu sou o bot de divulgação. Seu canal/grupo '{chat_title}' tem apenas {num_members} membros. "
-                                "Não o adicionarei à lista de divulgação por ter menos de 50 membros. Por favor, me remova do canal."
-                            )
-                        except Exception as e:
-                            logger.error(f"Erro ao enviar mensagem de aviso de membros insuficientes para {chat_id}: {e}")
-                        
-                        # Notifica o usuário que solicitou o cadastro, se soubermos quem é
-                        if user_id_solicitante:
-                             try:
-                                 await context.bot.send_message(
-                                     chat_id=user_id_solicitante,
-                                     text=f"⚠️ O cadastro do seu canal/grupo **{chat_title}** (`{chat_id}`) falhou. Ele tem apenas **{num_members}** membros, e o mínimo exigido é 50. Por favor, remova o bot do seu canal/grupo e tente novamente quando tiver mais membros.",
-                                     parse_mode='Markdown'
-                                 )
-                             except Exception as e:
-                                 logger.error(f"Erro ao enviar notificação de falha por membros insuficientes para o solicitante {user_id_solicitante}: {e}")
-                        
-                        # Opcional: fazer o bot sair se a regra não for atendida (descomente se quiser)
-                        # if chat_type in ['group', 'supergroup', 'channel']:
-                        #     await context.bot.leave_chat(chat_id)
-                        return # Sai da função, não cadastra o chat
-
-                    # Se passou em todas as verificações, cadastra o canal/grupo
-                    logger.info(f"INFO: Cadastrando canal/grupo: '{chat_title}' (ID: {chat_id}) com {num_members} membros.")
-                    bot_data['canais_e_grupos'][chat_id] = { # Armazena como str, pois chaves de JSON são strings
-                        'nome': chat_title,
-                        'tipo': chat_type,
-                        'link': invite_link,
-                        'membros': num_members
-                    }
-                    save_data()
-                    try:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"Obrigado por me adicionar! Canal/Grupo '{chat_title}' ({chat_id}) foi adicionado à lista de divulgação com {num_members} membros."
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar mensagem de sucesso de cadastro para {chat_id}: {e}")
-                    
-                    # Envia notificação ao usuário que solicitou o cadastro (se for diferente do chat_id)
-                    if user_id_solicitante and user_id_solicitante != chat_id:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id_solicitante,
-                                text=f"✅ Seu canal/grupo **{chat_title}** (`{chat_id}`) foi cadastrado com sucesso! Ele já está na nossa lista de divulgação. Você pode conferir a lista completa usando o comando /ver_canais (se você for o admin) ou aguardar a próxima publicação."
-                                , parse_mode='Markdown'
-                            )
-                        except Exception as e:
-                            logger.error(f"Erro ao enviar notificação de sucesso ao solicitante {user_id_solicitante}: {e}")
-
-                    # Envia notificação ao ADMIN_CHAT_ID
-                    if ADMIN_CHAT_ID:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=ADMIN_CHAT_ID,
-                                text=f"Novo canal/grupo cadastrado: **{chat_title}** (`{chat_id}`) com **{num_members}** membros. Link: {invite_link}",
-                                parse_mode='Markdown'
-                            )
-                        except Exception as e:
-                            logger.error(f"Erro ao enviar notificação de novo canal ao admin: {e}")
-                else:
-                    # O bot não tem as permissões necessárias
-                    error_message = f"Olá! Fui adicionado ao '{chat_title}', mas preciso ser **administrador** com permissões para **'Postar mensagens'** para funcionar corretamente."
-                    if not is_admin_in_chat:
-                        error_message += "\n- Por favor, me torne administrador."
-                    if not has_post_messages_perm:
-                        error_message += "\n- Por favor, me dê permissão para 'Postar mensagens'."
-                    error_message += "\nPor favor, me remova do canal/grupo e adicione-me novamente com as permissões corretas para que eu possa cadastrá-lo."
-                    
-                    logger.warning(f"AVISO: Bot adicionado sem permissões suficientes em '{chat_title}' (ID: {chat_id}). Mensagem enviada ao chat: '{error_message}'")
-                    try:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=error_message
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar mensagem de erro de permissão para {chat_id}: {e}")
-                    
-                    # Notifica o usuário que solicitou o cadastro, se soubermos quem é
-                    user_id_solicitante = context.user_data.pop('user_id_cadastro', None)
-                    if user_id_solicitante and user_id_solicitante != chat_id:
-                         try:
-                             await context.bot.send_message(
-                                 chat_id=user_id_solicitante,
-                                 text=f"⚠️ O cadastro do seu canal/grupo **{chat_title}** (`{chat_id}`) falhou. Não tenho as permissões necessárias. Por favor, remova o bot e adicione-o novamente garantindo as permissões de administrador (Postar mensagens e Adicionar membros).",
-                                 parse_mode='Markdown'
-                             )
-                         except Exception as e:
-                             logger.error(f"Erro ao enviar notificação de falha por permissão para o solicitante {user_id_solicitante}: {e}")
-
-                    # Notifica o ADMIN_CHAT_ID sobre o problema de permissão
-                    if ADMIN_CHAT_ID:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=ADMIN_CHAT_ID,
-                                text=f"**AVISO:** Fui adicionado ao canal/grupo **{chat_title}** (`{chat_id}`) mas não tenho as permissões de administrador necessárias. Não pude cadastrá-lo."
-                            )
-                        except Exception as admin_send_e:
-                            logger.error(f"Erro ao enviar aviso de permissão ao admin: {admin_send_e}")
-
+                # Obter o chat completo para verificar link de convite primário
+                chat_info = await context.bot.get_chat(chat_id_joined)
+                logger.debug(f"Chat info: {chat_info}")
             except Exception as e:
-                # Captura e loga qualquer erro inesperado durante o processo
-                logger.critical(
-                    f"ERRO CRÍTICO INESPERADO no new_chat_members para {chat_id}: {e}", exc_info=True)
+                logger.error(f"Erro ao obter informações do chat {chat_id_joined}: {e}")
+                # Se não conseguir info, não pode cadastrar
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"❌ Erro ao tentar obter informações do chat `{chat_name}` (`{chat_id_joined}`). Não foi possível cadastrar."
+                    , parse_mode='Markdown'
+                )
+                return
+
+            # Validação: Checar se o bot tem permissão de postar.
+            # Em canais, ele precisa ser admin para enviar mensagens.
+            # Em grupos, também.
+            try:
+                bot_status = await context.bot.get_chat_member(chat_id_joined, context.bot.id)
+                if not bot_status.can_post_messages: # Verifica a permissão 'post_messages' para canais/grupos
+                    await context.bot.send_message(
+                        chat_id=user_id_requesting_cadastro if user_id_requesting_cadastro else ADMIN_CHAT_ID,
+                        text=f"⚠️ Fui adicionado ao **{chat_name}**, mas não tenho permissão para enviar mensagens. Por favor, me dê essa permissão para que eu possa divulgar o canal/grupo."
+                        , parse_mode='Markdown'
+                    )
+                    logger.warning(f"Bot adicionado a {chat_name} ({chat_id_joined}) mas sem permissão de postagem.")
+                    return
+            except Exception as e:
+                logger.error(f"Erro ao verificar permissões do bot no chat {chat_id_joined}: {e}")
+                await context.bot.send_message(
+                    chat_id=user_id_requesting_cadastro if user_id_requesting_cadastro else ADMIN_CHAT_ID,
+                    text=f"❌ Erro ao verificar minhas permissões no chat `{chat_name}` (`{chat_id_joined}`). Por favor, verifique manualmente se tenho permissão para enviar mensagens."
+                    , parse_mode='Markdown'
+                )
+                return
+            
+            # Tentar obter o link de convite primário do chat, se disponível
+            # Este link é mais confiável do que o link fornecido pelo usuário.
+            # Para canais, bot.invite_link pode ser o link de convite principal se o bot for admin.
+            # Para grupos, é o link de convite, se tiver.
+            actual_invite_link = chat_info.invite_link if chat_info.invite_link else cadastrando_link
+            
+            if not actual_invite_link:
+                await context.bot.send_message(
+                    chat_id=user_id_requesting_cadastro if user_id_requesting_cadastro else ADMIN_CHAT_ID,
+                    text=f"❌ Não consegui obter o link de convite para **{chat_name}** (`{chat_id_joined}`). Não foi possível cadastrar. Por favor, certifique-se de que o bot tem permissão para gerenciar links de convite ou que você forneceu um link válido via /cadastrar."
+                    , parse_mode='Markdown'
+                )
+                logger.warning(f"Não foi possível obter o link de convite para {chat_name} ({chat_id_joined}).")
+                return
+
+            bot_data.setdefault('canais_e_grupos', {})
+            bot_data['canais_e_grupos'][chat_id_joined] = {
+                'nome': chat_name,
+                'tipo': chat_type,
+                'link': actual_invite_link,
+                'data_cadastro': datetime.datetime.now(TIMEZONE).isoformat() # Data de cadastro no fuso horário
+            }
+            save_data()
+
+            # Limpa o estado após o cadastro bem-sucedido
+            context.user_data.pop('estado', None)
+            context.user_data.pop('user_id_cadastro', None)
+            context.user_data.pop('cadastrando_link', None)
+
+            response_message = (
+                f"✅ **{chat_name}** foi cadastrado(a) com sucesso!\n"
+                f"Tipo: `{chat_type}`\n"
+                f"Link de convite: {actual_invite_link}\n\n"
+                "A partir de agora, este canal/grupo será incluído nas divulgações diárias."
+            )
+            
+            # Envia a confirmação para o usuário que pediu o cadastro (se houver)
+            if user_id_requesting_cadastro:
+                await context.bot.send_message(
+                    chat_id=user_id_requesting_cadastro,
+                    text=response_message,
+                    parse_mode='Markdown'
+                )
+            
+            # Envia também para o admin, se for diferente do usuário que pediu
+            if ADMIN_CHAT_ID and (not user_id_requesting_cadastro or user_id_requesting_cadastro != ADMIN_CHAT_ID):
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"🔔 **Notificação de Cadastro:**\n" + response_message,
+                    parse_mode='Markdown'
+                )
+            logger.info(f"Canal/grupo '{chat_name}' ({chat_id_joined}) cadastrado com sucesso.")
+
+        else:
+            logger.warning(f"Bot adicionado a um chat que não é grupo/supergrupo/canal: {chat_name} ({chat_id_joined}) Tipo: {chat_type}")
+            if ADMIN_CHAT_ID:
                 try:
                     await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="Ocorreu um erro interno ao tentar verificar minhas permissões ou cadastrar o chat. Por favor, contate o administrador do bot."
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"⚠️ Fui adicionado a um chat de tipo `{chat_type}` (não é grupo ou canal) `{chat_name}` (`{chat_id_joined}`). Não foi possível cadastrar."
+                        , parse_mode='Markdown'
                     )
-                except Exception as send_e:
-                    logger.error(f"Erro ao enviar mensagem de erro crítico para {chat_id}: {send_e}")
-                
-                user_id_solicitante = context.user_data.pop('user_id_cadastro', None)
-                if user_id_solicitante and user_id_solicitante != chat_id:
-                     try:
-                         await context.bot.send_message(
-                             chat_id=user_id_solicitante,
-                             text=f"❌ Ocorreu um erro inesperado ao tentar cadastrar seu canal/grupo **{chat_title}** (`{chat_id}`). Por favor, contate o administrador do bot."
-                         , parse_mode='Markdown')
-                     except Exception as e:
-                         logger.error(f"Erro ao enviar notificação de erro inesperado ao solicitante {user_id_solicitante}: {e}")
+                except Exception as e:
+                    logger.error(f"Erro ao notificar admin sobre tipo de chat inválido: {e}")
 
-                if ADMIN_CHAT_ID:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=ADMIN_CHAT_ID,
-                            text=f"**ERRO CRÍTICO:** Ocorreu um erro inesperado no `new_chat_members` ao processar a adição do bot ao chat **{chat_title}** (`{chat_id}`). Erro: `{e}`"
-                        )
-                    except Exception as admin_send_e:
-                        logger.error(f"Erro ao enviar erro crítico ao admin: {admin_send_e}")
-            
-            # Limpa o estado de aguardando_link_cadastro e o user_id_cadastro SOMENTE APÓS O PROCESSAMENTO DO BOT
-            if 'estado' in context.user_data and context.user_data['estado'] == 'aguardando_link_cadastro':
-                context.user_data.pop('estado')
-            if 'cadastrando_link' in context.user_data:
-                context.user_data.pop('cadastrando_link')
-            if 'user_id_cadastro' in context.user_data:
-                context.user_data.pop('user_id_cadastro')
+async def handle_left_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lida com a remoção de membros do chat."""
+    # Se o bot foi removido de um grupo/canal
+    if update.message.left_chat_member.id == context.bot.id:
+        chat_id_left = update.message.chat_id
+        if chat_id_left in bot_data.get('canais_e_grupos', {}):
+            removed_name = bot_data['canais_e_grupos'][chat_id_left]['nome']
+            del bot_data['canais_e_grupos'][chat_id_left]
+            save_data()
+            logger.info(f"Bot foi removido do chat '{removed_name}' ({chat_id_left}). Removido da lista de divulgação.")
+            if ADMIN_CHAT_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"⚠️ **ATENÇÃO:** Fui removido(a) do canal/grupo **'{removed_name}'** (`{chat_id_left}`). Ele(a) foi automaticamente removido(a) da sua lista de divulgação."
+                        , parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao notificar admin sobre saída do chat: {e}")
 
-            return # Processamos a adição do bot, então saímos do loop de membros.
+# --- Função Main e Execução do Bot ---
+async def main() -> None:
+    """Inicia o bot e o loop de eventos."""
+    load_data() # Carrega os dados antes de iniciar o aplicativo
 
-    logger.debug("DEBUG: O bot não foi o membro adicionado ou nenhum bot foi adicionado neste evento.")
-
-
-async def left_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lida com a saída de membros do chat, incluindo o próprio bot."""
-    logger.debug(f"DEBUG: left_chat_member acionada. Chat ID: {update.message.chat_id}, Título: '{update.message.chat.title}'")
-    
-    if not update.message: # Verificação de segurança
-        logger.warning("left_chat_member chamada sem update.message. Ignorando.")
-        return
-
-    bot_member = await context.bot.get_me()
-    chat_id = update.message.chat_id # ID como int
-    chat_title = update.message.chat.title
-
-    # Verifica cada membro que saiu
-    for member in update.message.left_chat_member:
-        logger.debug(f"DEBUG: Membro que saiu: {member.full_name} (ID: {member.id}), é bot: {member.is_bot}")
-
-        # Se o membro que saiu for o próprio bot
-        if member.id == bot_member.id:
-            logger.info(f"INFO: O bot foi removido do chat '{chat_title}' ({chat_id}).")
-
-            if chat_id in bot_data.get('canais_e_grupos', {}):
-                del bot_data['canais_e_grupos'][chat_id]
-                save_data()
-                logger.info(f"INFO: Canal/grupo '{chat_title}' ({chat_id}) removido da lista de divulgação.")
-                if ADMIN_CHAT_ID:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=ADMIN_CHAT_ID,
-                            text=f"**AVISO:** O bot foi removido do canal/grupo **{chat_title}** (`{chat_id}`). Ele foi removido da lista de divulgação.",
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar aviso de remoção de chat ao admin: {e}")
-            else:
-                logger.info(f"INFO: Bot saiu de um chat não cadastrado: '{chat_title}' ({chat_id}).")
-                if ADMIN_CHAT_ID:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=ADMIN_CHAT_ID,
-                            text=f"**INFO:** O bot foi removido de um canal/grupo **não cadastrado**: **{chat_title}** (`{chat_id}`).",
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar aviso de saída de chat não cadastrado ao admin: {e}")
-            return # Já tratamos a saída do bot, não precisamos verificar outros membros.
-    logger.debug("DEBUG: Um membro saiu, mas não foi o bot.")
-
-
-# --- Função Main (Início do Bot e Registro de Handlers) ---
-def main() -> None:
-    """Inicia o bot."""
-    # Carrega os dados persistentes no início
-    load_data()
-
-    # Inicia o servidor Flask em uma thread separada para keep-alive (para Render.com)
-    keep_alive()
-
-    # Cria o Application e passa o token do bot
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Se já houver um ADMIN_CHAT_ID, tente agendar os jobs no startup.
-    # Usar job_queue.run_once para chamar a função assíncrona.
-    if ADMIN_CHAT_ID:
-        # job_queue.run_once executa a corrotina no loop de eventos do PTB
-        application.job_queue.run_once(agendar_daily_jobs_on_startup, 0)
-        logger.info(f"ADMIN_CHAT_ID carregado no bot: {ADMIN_CHAT_ID}. Tentando agendar jobs.")
-    else:
-        logger.info("ADMIN_CHAT_ID não definido. Aguardando o comando /start do administrador.")
-
-
-    # --- REGISTRO DE TODOS OS HANDLERS ---
-    # CommandHandlers
+    # Adiciona os handlers de comandos
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cadastrar", cadastrar))
-    application.add_handler(CommandHandler("ver_canais", ver_canais_e_grupos))
-    application.add_handler(CommandHandler("editar_cabecalho", editar_cabecalho)) # Novo comando
-    application.add_handler(CommandHandler("agendar", agendar))
-    application.add_handler(CommandHandler("parar_agendamento", parar_agendamento))
-    application.add_handler(CommandHandler("retomar_agendamento", retomar_agendamento))
-    application.add_handler(CommandHandler("testar_envio", testar_envio))
     application.add_handler(CommandHandler("ajuda", ajuda))
-    application.add_handler(CommandHandler("remover_canal", remover_canal))
-    application.add_handler(CommandHandler("cancelar", cancelar)) # Importante para sair de estados
+    application.add_handler(CommandHandler("cancelar", cancelar))
+    application.add_handler(CommandHandler("vercanais", ver_canais_e_grupos))
+    application.add_handler(CommandHandler("editarcabecalho", editar_cabecalho))
+    application.add_handler(CommandHandler("agendar", agendar))
+    application.add_handler(CommandHandler("pararagendamento", parar_agendamento))
+    application.add_handler(CommandHandler("retomaragendamento", retomar_agendamento))
+    application.add_handler(CommandHandler("testarenvio", testar_envio))
+    application.add_handler(CommandHandler("removercanal", remover_canal))
 
-    # MessageHandlers (para texto, mídia e atualizações de status)
-    # Importante: o filters.COMMAND deve vir antes do filters.TEXT
+    # Adiciona handlers para mensagens de texto, mídia, e membros de chat
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_response))
-    application.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION), handle_media_cabecalho))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members))
-    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, left_chat_member))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.ANIMATION, handle_media_response))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, handle_left_chat_member))
 
-    # CallbackQueryHandler (para botões inline)
+    # Adiciona handler para callbacks de botões inline
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Inicia o polling do bot
-    logger.info("Bot Telegram iniciando polling...")
-    try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        logger.critical(f"Erro crítico ao iniciar o polling do bot: {e}", exc_info=True)
+    # Inicia o servidor Flask em uma thread separada para o Keep-Alive
+    keep_alive()
+
+    # Agenda os jobs diários na inicialização (se ADMIN_CHAT_ID já estiver definido)
+    # Deve ser feito APÓS o build da application e antes de start_polling
+    application.job_queue.run_once(agendar_daily_jobs_on_startup, 1) # Roda 1 segundo após o app iniciar
+
+    logger.info("Bot iniciando polling...")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    # Garante que a função main seja executada apenas quando o script é o principal.
-    main()
+    try:
+        # AQUI MANTEMOS A CHAMADA SIMPLES, CONFIANDO QUE O REPLIT (ou Render)
+        # lidará com o loop de eventos sem conflito.
+        asyncio.run(main())
+    except Exception as e:
+        logger.critical(f"Erro crítico no loop principal do bot: {e}", exc_info=True)
+        
