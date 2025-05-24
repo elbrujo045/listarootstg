@@ -1,0 +1,3 @@
+python-telegram-bot
+flask
+gunicorn # Servidor HTTP para o Flask (Render usa gunicorn por padrão)
