@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Variáveis Globais (Carregadas ou Definidas) ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "SEU_TOKEN_DO_BOT_AQUI")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7452415037:AAHPYwIeI_2TAXCUHxcKcaZfSPX7E7Nv7eg")
 if BOT_TOKEN == "SEU_TOKEN_DO_BOT_AQUI":
     logger.critical("ATENÇÃO: BOT_TOKEN não configurado! Por favor, defina a variável de ambiente BOT_TOKEN.")
 
@@ -874,21 +874,19 @@ async def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Inicia o servidor Flask em uma thread separada para o Keep-Alive
+    # Isso deve ser feito ANTES do bot iniciar o polling para evitar conflitos de loop.
     keep_alive()
 
     # Agenda os jobs diários na inicialização (se ADMIN_CHAT_ID já estiver definido)
-    # Deve ser feito APÓS o build da application e antes de start_polling
-    application.job_queue.run_once(agendar_daily_jobs_on_startup, 1) # Roda 1 segundo após o app iniciar
+    # Isso é agendado para rodar 1 segundo após o aplicativo iniciar
+    application.job_queue.run_once(agendar_daily_jobs_on_startup, 1)
 
     logger.info("Bot iniciando polling...")
+    # Esta é a chamada que o Replit espera e que gerencia o loop de eventos
+    # para o bot.
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
-    try:
-        # AQUI MANTEMOS A CHAMADA SIMPLES, CONFIANDO QUE O REPLIT (ou Render)
-        # lidará com o loop de eventos sem conflito.
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Erro crítico no loop principal do bot: {e}", exc_info=True)
-        
+# *** REMOVA COMPLETAMENTE O BLOCO if __name__ == "__main__": ***
+# NADA DEVE VIR DEPOIS DA FUNÇÃO main()
+
